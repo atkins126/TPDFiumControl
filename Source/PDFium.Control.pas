@@ -3,25 +3,26 @@
 interface
 
 uses
-  Winapi.Messages, Winapi.Windows, System.Classes, System.Math, System.SysUtils, System.Variants, Vcl.Controls,
-  Vcl.Dialogs, Vcl.ExtCtrls, Vcl.Forms, Vcl.Graphics, Vcl.StdCtrls, PDFiumCore, PDFiumLib
+  Winapi.Messages, Winapi.Windows, System.Classes, System.Math, System.SysUtils, System.UITypes, System.Variants,
+  Vcl.Controls, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.Forms, Vcl.Graphics, PDFiumCore, PDFiumLib
 {$IFDEF ALPHASKINS}, acSBUtils, sCommonData{$ENDIF};
 
 type
   TPDFZoomMode = (zmActualSize, zmFitHeight, zmFitWidth, zmPercent);
 
-  TSelectionArray = TArray<TPDFRect>;
   TPDFControlRectArray = array of TRect;
-  TPDFControlPDFRectArray = array of TPDFRect;
+  TPDFControlPDFRectArray = TArray<TPDFRect>;
 
   TPDFControlScrollEvent = procedure(const ASender: TObject; const AScrollBar: TScrollBarKind) of object;
-  TPDFLoadProtectedEvent = procedure(const ASender: TObject; var APassword: AnsiString) of object;
+  TPDFLoadProtectedEvent = procedure(const ASender: TObject; var APassword: UTF8String) of object;
 
   TPageInfo = record
     Height: Single;
     Index: Integer;
     Rect: TRect;
     Rotation: TPDFPageRotation;
+    SearchCurrentIndex: Integer;
+    SearchRects: TPDFControlPDFRectArray;
     Visible: Integer;
     Width: Single;
   end;
@@ -37,7 +38,7 @@ type
     FChanged: Boolean;
     FFilename: string;
     FFormFieldFocused: Boolean;
-    FFormOutputSelectedRects: TPDFRectArray;
+    FFormOutputSelectedRects: TPDFControlPDFRectArray;
     FHeight: Single;
     FMouseDownPoint: TPoint;
     FMousePressed: Boolean;
@@ -54,6 +55,12 @@ type
 {$IFDEF ALPHASKINS}
     FScrollWnd: TacScrollWnd;
 {$ENDIF}
+    FSearchCount: Integer;
+    FSearchHighlightAll: Boolean;
+    FSearchIndex: Integer;
+    FSearchMatchCase: Boolean;
+    FSearchText: string;
+    FSearchWholeWords: Boolean;
     FSelectionActive: Boolean;
     FSelectionStartCharIndex: Integer;
     FSelectionStopCharIndex: Integer;
@@ -82,6 +89,7 @@ type
     function SelectWord(const ACharIndex: Integer): Boolean;
     function SetSelStopCharIndex(const X, Y: Integer): Boolean;
     procedure AdjustPageInfo;
+    procedure AdjustScrollBar(const APageIndex: Integer);
     procedure AdjustZoom;
     procedure AfterLoad;
     procedure DoScroll(const AScrollBarKind: TScrollBarKind);
@@ -92,9 +100,11 @@ type
     procedure GetPageWebLinks;
     procedure InvalidateRectDiffs(const AOldRects, ANewRects: TPDFControlRectArray);
     procedure PageChanged;
-    procedure PaintAlphaSelection(ADC: HDC; const APage: TPDFPage; const ARects: TPDFRectArray; const AIndex: Integer);
+    procedure PaintAlphaSelection(ADC: HDC; const APage: TPDFPage; const ARects: TPDFControlPDFRectArray; const AIndex: Integer;
+      const AColor: TColor = TColors.SysNone);
     procedure PaintPage(ADC: HDC; const APage: TPDFPage; const AIndex: Integer);
     procedure PaintPageBorder(ADC: HDC; const ARect: TRect);
+    procedure PaintPageSearchResults(ADC: HDC; const APage: TPDFPage; const AIndex: Integer);
     procedure PaintPageSelection(ADC: HDC; const APage: TPDFPage; const AIndex: Integer);
     procedure SetPageCount(const AValue: Integer);
     procedure SetPageIndex(const AValue: Integer);
@@ -129,16 +139,23 @@ type
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
+    function FindNext: Integer;
+    function FindPrevious: Integer;
     function IsTextSelected: Boolean;
+    function SearchAll: Integer; overload;
+    function SearchAll(const ASearchText: string): Integer; overload;
+    function SearchAll(const ASearchText: string; const AHighlightAll: Boolean; const AMatchCase: Boolean;
+      const AWholeWords: Boolean): Integer; overload;
 {$IFDEF ALPHASKINS}
     procedure AfterConstruction; override;
 {$ENDIF}
+    procedure ClearSearch;
     procedure ClearSelection;
     procedure CloseDocument;
     procedure CopyToClipboard;
     procedure CreateParams(var AParams: TCreateParams); override;
     procedure GotoNextPage;
-    procedure GotoPage(const AIndex: Integer);
+    procedure GotoPage(const AIndex: Integer; const ASetScrollBar: Boolean = True);
     procedure GotoPreviousPage;
     procedure LoadFromFile(const AFilename: string);
     procedure LoadFromStream(const AStream: TStream);
@@ -162,6 +179,9 @@ type
     property PageCount: Integer read FPageCount;
     property PageIndex: Integer read FPageIndex write SetPageIndex;
     property PageNumber: Integer read GetPageNumber write SetPageNumber;
+    property SearchCount: Integer read FSearchCount write FSearchCount;
+    property SearchIndex: Integer read FSearchIndex write FSearchIndex;
+    property SearchText: string read FSearchText write FSearchText;
     property SelectionLength: Integer read GetSelectionLength;
     property SelectionStart: Integer read GetSelectionStart;
     property SelectionText: string read GetSelectionText;
@@ -175,6 +195,9 @@ type
     property PageMargin: Integer read FPageMargin write FPageMargin default 6;
     property PopupMenu;
     property PrintJobTitle: string read FPrintJobTitle write FPrintJobTitle;
+    property SearchHighlightAll: Boolean read FSearchHighlightAll write FSearchHighlightAll;
+    property SearchMatchCase: Boolean read FSearchMatchCase write FSearchMatchCase;
+    property SearchWholeWords: Boolean read FSearchWholeWords write FSearchWholeWords;
     property ZoomMode: TPDFZoomMode read FZoomMode write SetZoomMode default zmActualSize;
     property ZoomPercent: Single read FZoomPercent write SetZoomPercent;
   end;
@@ -198,7 +221,8 @@ type
 implementation
 
 uses
-  Winapi.ShellAPI, System.Character, System.Types, System.UITypes, Vcl.Clipbrd, Vcl.Printers
+  Winapi.ShellAPI, System.Character, System.Generics.Collections, System.Generics.Defaults, System.Types, Vcl.Clipbrd,
+  Vcl.Printers
 {$IFDEF ALPHASKINS}, sConst, sDialogs, sMessages, sStyleSimply, sVCLUtils{$ENDIF};
 
 const
@@ -219,6 +243,8 @@ begin
 {$IFDEF ALPHASKINS}
   FSkinData := TsScrollWndData.Create(Self, True);
   FSkinData.COC := COC_TsMemo;
+  FSkinData.CustomFont := True;
+  StyleElements := [seBorder];
 {$ENDIF}
 
   inherited Create(AOwner);
@@ -391,7 +417,7 @@ end;
 
 procedure TPDFiumControl.LoadFromFile(const AFilename: string);
 var
-  LPassword: AnsiString;
+  LPassword: UTF8String;
 begin
   FFilename := AFilename;
   try
@@ -418,7 +444,7 @@ end;
 
 procedure TPDFiumControl.LoadFromStream(const AStream: TStream);
 var
-  LPassword: AnsiString;
+  LPassword: UTF8String;
 begin
   try
     FPDFDocument.LoadFromStream(AStream);
@@ -476,6 +502,7 @@ begin
         Width := LPage.Width;
         Height := LPage.Height;
         Rotation := prNormal;
+        SearchCurrentIndex := -1;
       end;
 
       if LPage.Width > FWidth then
@@ -587,6 +614,218 @@ begin
   SetSelection(False, 0, 0);
 end;
 
+function TPDFiumControl.SearchAll: Integer;
+begin
+  Result := SearchAll(FSearchText, FSearchHighlightAll, FSearchMatchCase, FSearchWholeWords);
+end;
+
+function TPDFiumControl.SearchAll(const ASearchText: string): Integer;
+begin
+  Result := SearchAll(ASearchText, FSearchHighlightAll, FSearchMatchCase, FSearchWholeWords);
+end;
+
+procedure TPDFiumControl.AdjustScrollBar(const APageIndex: Integer);
+var
+  LRect: TRect;
+  LPageRect: TRect;
+begin
+  with FPageInfo[APageIndex] do
+  begin
+    LPageRect := System.Types.Rect(0, 0, Round(Width), Round(Height));
+    LRect := InternPageToDevice(FPDFDocument.Pages[APageIndex], SearchRects[SearchCurrentIndex], LPageRect);
+    VertScrollBar.Position := GetPageTop(APageIndex) + Round( (VertScrollBar.Range / PageCount) *
+      LRect.Top / LPageRect.Height ) - 2 * LRect.Height;
+  end;
+
+  FChanged := True;
+end;
+
+function TPDFiumControl.SearchAll(const ASearchText: string; const AHighlightAll: Boolean; const AMatchCase: Boolean;
+  const AWholeWords: Boolean): Integer;
+var
+  LCount, LRectCount: Integer;
+  LCharIndex, LCharCount: Integer;
+  LIndex, LPageIndex: Integer;
+  LPage: TPDFPage;
+begin
+  Result := 0;
+
+  FSearchText := ASearchText;
+  FSearchHighlightAll := AHighlightAll;
+  FSearchMatchCase := AMatchCase;
+  FSearchWholeWords := AWholeWords;
+
+  ClearSearch;
+  FSearchIndex := 0;
+
+  if IsPageValid then
+  begin
+    for LPageIndex := 0 to FPageCount - 1 do
+    with FPageInfo[LPageIndex] do
+    begin
+      LPage := FPDFDocument.Pages[LPageIndex];
+
+      LCount := 0;
+
+      if not FSearchText.IsEmpty then
+      begin
+        if LPage.BeginFind(FSearchText, FSearchMatchCase, FSearchWholeWords, False) then
+        try
+          while LPage.FindNext(LCharIndex, LCharCount) do
+          begin
+            LRectCount := LPage.GetTextRectCount(LCharIndex, LCharCount);
+
+            if LCount + LRectCount > Length(SearchRects) then
+              SetLength(SearchRects, (LCount + LRectCount) * 2);
+
+            for LIndex := 0 to LRectCount - 1 do
+            begin
+              SearchRects[LCount] := LPage.GetTextRect(LIndex);
+              Inc(LCount);
+            end;
+          end;
+        finally
+          LPage.EndFind;
+        end;
+
+        if LCount <> Length(SearchRects) then
+          SetLength(SearchRects, LCount);
+
+        if Length(SearchRects) > 0 then
+          TArray.Sort<TPDFRect>(SearchRects, TComparer<TPDFRect>.Construct(
+            function (const ALeft, ARight: TPDFRect): Integer
+            begin
+              Result := Trunc(ARight.Top) - Trunc(ALeft.Top);
+              if Result = 0 then
+                Result := Trunc(ALeft.Left) - Trunc(ARight.Left);
+            end)
+          );
+
+        Inc(Result, LCount);
+      end;
+    end;
+
+    for LPageIndex := 0 to FPageCount - 1 do
+    with FPageInfo[LPageIndex] do
+    if Length(SearchRects) > 0 then
+    begin
+      SearchCurrentIndex := 0;
+      GotoPage(LPageIndex, False);
+      AdjustScrollBar(LPageIndex);
+
+      Break;
+    end;
+  end;
+
+  FSearchCount := Result;
+
+  Invalidate;
+end;
+
+function TPDFiumControl.FindNext: Integer;
+var
+  LPageIndex: Integer;
+  LNextPage: Boolean;
+begin
+  Result := FSearchIndex;
+
+  if FSearchIndex + 1 >= FSearchCount then
+    Exit;
+
+  Inc(FSearchIndex);
+
+  LNextPage := False;
+
+  for LPageIndex := 0 to FPageCount - 1 do
+  with FPageInfo[LPageIndex] do
+  begin
+    if LNextPage and (Length(SearchRects) > 0) then
+    begin
+      SearchCurrentIndex := 0;
+      Break;
+    end
+    else
+    if SearchCurrentIndex <> -1 then
+    begin
+      if SearchCurrentIndex + 1 < Length(SearchRects) then
+      begin
+        Inc(SearchCurrentIndex);
+        Break;
+      end
+      else
+      begin
+        SearchCurrentIndex := -1;
+        LNextPage := True;
+      end;
+    end;
+  end;
+
+  GotoPage(LPageIndex, False);
+  AdjustScrollBar(LPageIndex);
+
+  Result := FSearchIndex;
+
+  Invalidate;
+end;
+
+function TPDFiumControl.FindPrevious: Integer;
+var
+  LPageIndex: Integer;
+  LPreviousPage: Boolean;
+begin
+  Result := FSearchIndex;
+
+  if FSearchIndex - 1 < 0 then
+    Exit;
+
+  Dec(FSearchIndex);
+
+  LPreviousPage := False;
+
+  for LPageIndex := FPageCount - 1 downto 0 do
+  with FPageInfo[LPageIndex] do
+  begin
+    if LPreviousPage and (Length(SearchRects) > 0) then
+    begin
+      SearchCurrentIndex := Length(SearchRects) - 1;
+      Break;
+    end
+    else
+    if SearchCurrentIndex <> -1 then
+    begin
+      if SearchCurrentIndex - 1 >= 0 then
+      begin
+        Dec(SearchCurrentIndex);
+        Break;
+      end
+      else
+      begin
+        SearchCurrentIndex := -1;
+        LPreviousPage := True;
+      end;
+    end;
+  end;
+
+  GotoPage(LPageIndex, False);
+  AdjustScrollBar(LPageIndex);
+
+  Result := FSearchIndex;
+
+  Invalidate;
+end;
+
+procedure TPDFiumControl.ClearSearch;
+var
+  LIndex: Integer;
+begin
+  if IsPageValid then
+  for LIndex := 0 to FPageCount - 1 do
+  begin
+    SetLength(FPageInfo[LIndex].SearchRects, 0);
+    FPageInfo[LIndex].SearchCurrentIndex := -1;
+  end;
+end;
+
 procedure TPDFiumControl.SelectAll;
 begin
   SelectText(0, -1);
@@ -636,10 +875,11 @@ begin
     Dec(LPageIndex);
     LY := LY + FPageInfo[LPageIndex].Height;
   end;
+
   Inc(Result, PageToScreen(LY));
 end;
 
-procedure TPDFiumControl.GotoPage(const AIndex: Integer);
+procedure TPDFiumControl.GotoPage(const AIndex: Integer; const ASetScrollBar: Boolean = True);
 begin
   if FPageIndex = AIndex then
     Exit;
@@ -648,7 +888,8 @@ begin
   begin
     PageIndex := AIndex;
     FChanged := True;
-    VertScrollBar.Position := GetPageTop(AIndex);
+    if ASetScrollBar then
+      VertScrollBar.Position := GetPageTop(AIndex);
   end;
 end;
 
@@ -1130,6 +1371,9 @@ begin
           PaintPageSelection(ADC, LPage, LIndex);
         PaintAlphaSelection(ADC, LPage, FFormOutputSelectedRects, LIndex);
       end;
+
+      PaintPageSearchResults(ADC, LPage, LIndex);
+
 {$IFDEF ALPHASKINS}
       if IsLightStyleColor(Color) then
 {$ENDIF}
@@ -1164,7 +1408,7 @@ procedure TPDFiumControl.PaintPageSelection(ADC: HDC; const APage: TPDFPage; con
 var
   LCount: Integer;
   LIndex: Integer;
-  LRects: TPDFRectArray;
+  LRects: TPDFControlPDFRectArray;
 begin
   LCount := APage.GetTextRectCount(SelectionStart, SelectionLength);
   if LCount > 0 then
@@ -1172,8 +1416,15 @@ begin
     SetLength(LRects, LCount);
     for LIndex := 0 to LCount - 1 do
       LRects[LIndex] := APage.GetTextRect(LIndex);
+
     PaintAlphaSelection(ADC, APage, LRects, AIndex);
   end;
+end;
+
+procedure TPDFiumControl.PaintPageSearchResults(ADC: HDC; const APage: TPDFPage; const AIndex: Integer);
+begin
+  if Length(FPageInfo[AIndex].SearchRects) > 0 then
+    PaintAlphaSelection(ADC, APage, FPageInfo[AIndex].SearchRects, AIndex, RGB(204, 224, 204));
 end;
 
 function TPDFiumControl.InternPageToDevice(const APage: TPDFPage; const APageRect: TPDFRect; const ARect: TRect): TRect;
@@ -1181,33 +1432,68 @@ begin
   Result := APage.PageToDevice(ARect.Left, ARect.Top, ARect.Width, ARect.Height, APageRect, APage.Rotation);
 end;
 
-procedure TPDFiumControl.PaintAlphaSelection(ADC: HDC; const APage: TPDFPage; const ARects: TPDFRectArray; const AIndex: Integer);
+procedure TPDFiumControl.PaintAlphaSelection(ADC: HDC; const APage: TPDFPage; const ARects: TPDFControlPDFRectArray;
+  const AIndex: Integer; const AColor: TColor = TColors.SysNone);
 var
   LCount: Integer;
   LIndex: Integer;
   LRect: TRect;
   LDC: HDC;
   LBitmap: TBitmap;
-  LBlendFunc: TBlendFunction;
+  LBlendFunction: TBlendFunction;
+  LSearchColors: Boolean;
+
+  function SetBrushColor: Boolean;
+  var
+    LColor: TColor;
+  begin
+    Result := True;
+
+    LColor := AColor;
+
+    if not LSearchColors then
+      LColor := RGB(204, 204, 255)
+    else
+    if FPageInfo[AIndex].SearchCurrentIndex = LIndex then
+      LColor := RGB(240, 204, 238)
+    else
+    if not FSearchHighlightAll then
+      Result := False;
+
+    if Result and (LColor <> LBitmap.Canvas.Brush.Color) then
+    begin
+      LBitmap.Canvas.Brush.Color := LColor;
+      LBitmap.SetSize(100, 0);
+      LBitmap.SetSize(100, 50);
+      LDC := LBitmap.Canvas.Handle;
+    end;
+  end;
 begin
   LCount := Length(ARects);
   if LCount > 0 then
   begin
     LBitmap := TBitmap.Create;
     try
-      LBitmap.Canvas.Brush.Color := RGB(50, 142, 254);
-      LBitmap.SetSize(100, 50);
-      LBlendFunc.BlendOp := AC_SRC_OVER;
-      LBlendFunc.BlendFlags := 0;
-      LBlendFunc.SourceConstantAlpha := 127;
-      LBlendFunc.AlphaFormat := 0;
-      LDC := LBitmap.Canvas.Handle;
+      LSearchColors := AColor <> TColors.SysNone;
+
+      LBlendFunction.BlendOp := AC_SRC_OVER;
+      LBlendFunction.BlendFlags := 0;
+      LBlendFunction.SourceConstantAlpha := 128;
+      LBlendFunction.AlphaFormat := 0;
+
       for LIndex := 0 to LCount - 1 do
       begin
+        if not SetBrushColor then
+          Continue;
+
         LRect := InternPageToDevice(APage, ARects[LIndex], FPageInfo[AIndex].Rect);
+
+        if LSearchColors then
+          LRect.Inflate(4, 4);
+
         if RectVisible(ADC, LRect) then
           AlphaBlend(ADC, LRect.Left, LRect.Top, LRect.Width, LRect.Height, LDC, 0, 0, LBitmap.Width, LBitmap.Height,
-            LBlendFunc);
+            LBlendFunction);
       end;
     finally
       LBitmap.Free;
