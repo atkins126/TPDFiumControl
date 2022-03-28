@@ -1,5 +1,7 @@
 ﻿unit PDFium.Control;
 
+{.$DEFINE USE_LOAD_FROM_URL}
+
 interface
 
 uses
@@ -110,6 +112,7 @@ type
     procedure SetPageIndex(const AValue: Integer);
     procedure SetPageNumber(const AValue: Integer);
     procedure SetScrollSize;
+    procedure SetSearchHighlightAll(const AValue: Boolean);
     procedure SetSelection(const AActive: Boolean; const AStartIndex, AStopIndex: Integer);
     procedure SetZoomMode(const AValue: TPDFZoomMode);
     procedure SetZoomPercent(const AValue: Single);
@@ -159,6 +162,9 @@ type
     procedure GotoPreviousPage;
     procedure LoadFromFile(const AFilename: string);
     procedure LoadFromStream(const AStream: TStream);
+{$IFDEF USE_LOAD_FROM_URL}
+    procedure LoadFromURL(const AURL: string);
+{$ENDIF}
     procedure Print;
     procedure RotatePageClockwise;
     procedure RotatePageCounterClockwise;
@@ -195,7 +201,7 @@ type
     property PageMargin: Integer read FPageMargin write FPageMargin default 6;
     property PopupMenu;
     property PrintJobTitle: string read FPrintJobTitle write FPrintJobTitle;
-    property SearchHighlightAll: Boolean read FSearchHighlightAll write FSearchHighlightAll;
+    property SearchHighlightAll: Boolean read FSearchHighlightAll write SetSearchHighlightAll;
     property SearchMatchCase: Boolean read FSearchMatchCase write FSearchMatchCase;
     property SearchWholeWords: Boolean read FSearchWholeWords write FSearchWholeWords;
     property ZoomMode: TPDFZoomMode read FZoomMode write SetZoomMode default zmActualSize;
@@ -223,6 +229,7 @@ implementation
 uses
   Winapi.ShellAPI, System.Character, System.Generics.Collections, System.Generics.Defaults, System.Types, Vcl.Clipbrd,
   Vcl.Printers
+{$IFDEF USE_LOAD_FROM_URL}, IdHTTP, IdSSLOpenSSL{$ENDIF}
 {$IFDEF ALPHASKINS}, sConst, sDialogs, sMessages, sStyleSimply, sVCLUtils{$ENDIF};
 
 const
@@ -439,6 +446,7 @@ begin
     else
       ShowError(E.Message);
   end;
+
   AfterLoad;
 end;
 
@@ -465,8 +473,42 @@ begin
     else
       ShowError(E.Message);
   end;
+
   AfterLoad;
 end;
+
+{$IFDEF USE_LOAD_FROM_URL}
+procedure TPDFiumControl.LoadFromURL(const AURL: string);
+var
+  LStream: TMemoryStream;
+  LHTTPClient: TIdHTTP;
+begin
+  LHTTPClient := TIdHTTP.Create;
+  try
+    LStream := TMemoryStream.Create;
+    try
+      LHTTPClient.ReadTimeout := 60000;
+      if Pos('https://', AURL) = 1 then
+      begin
+        LHTTPClient.IOHandler := TIdSSLIOHandlerSocketOpenSSL.Create(LHTTPClient);
+        with TIdSSLIOHandlerSocketOpenSSL(LHTTPClient.IOHandler).SSLOptions do
+        begin
+          Method := sslvTLSv1_2;
+          SSLVersions := SSLVersions + [sslvTLSv1_2];
+        end;
+        LHTTPClient.Request.BasicAuthentication := True;
+      end;
+      LHTTPClient.Get(AURL, LStream);
+      LStream.Position := 0;
+      LoadFromStream(LStream);
+    finally
+      FreeAndNil(LStream);
+    end;
+  finally
+    LHTTPClient.Free;
+  end;
+end;
+{$ENDIF}
 
 procedure TPDFiumControl.AfterLoad;
 begin
@@ -556,6 +598,13 @@ begin
   LZoom := FZoomPercent / 100 * Screen.PixelsPerInch / 72;
   HorzScrollBar.Range := Round(FWidth * LZoom) + FPageMargin * 2;
   VertScrollBar.Range := Round(FHeight * LZoom) + FPageMargin * (FPageCount + 1);
+end;
+
+procedure TPDFiumControl.SetSearchHighlightAll(const AValue: Boolean);
+begin
+  FSearchHighlightAll := AValue;
+
+  Invalidate;
 end;
 
 procedure TPDFiumControl.SetZoomPercent(const AValue: Single);
@@ -862,6 +911,11 @@ begin
   Result := FPageIndex + 1;
 end;
 
+function TPDFiumControl.PageToScreen(const AValue: Single): Integer;
+begin
+  Result := Round(AValue * ZoomToScreen);
+end;
+
 function TPDFiumControl.GetPageTop(const APageIndex: Integer): Integer;
 var
   LY: Double;
@@ -897,7 +951,7 @@ procedure TPDFiumControl.AdjustPageInfo;
 var
   LIndex: Integer;
   LTop: Double;
-  LZoom: Double;
+  LScale: Double;
   LClient: TRect;
   LRect: TRect;
   LMargin: Integer;
@@ -908,13 +962,13 @@ begin
   LClient := ClientRect;
   LTop := 0;
   LMargin := FPageMargin;
-  LZoom := FZoomPercent / 100 * Screen.PixelsPerInch / 72;
+  LScale := FZoomPercent / 100 * Screen.PixelsPerInch / 72;
   for LIndex := 0 to FPageCount - 1 do
   begin
-    LRect.Top := Round(LTop * LZoom) + LMargin - VertScrollBar.Position;
-    LRect.Left := FPageMargin + Round((FWidth - FPageInfo[LIndex].Width) / 2 * LZoom) - HorzScrollBar.Position;
-    LRect.Width := Round(FPageInfo[LIndex].Width * LZoom);
-    LRect.Height := Round(FPageInfo[LIndex].Height * LZoom);
+    LRect.Top := Round(LTop * LScale) + LMargin - VertScrollBar.Position;
+    LRect.Left := FPageMargin + Round((FWidth - FPageInfo[LIndex].Width) / 2 * LScale) - HorzScrollBar.Position;
+    LRect.Width := Round(FPageInfo[LIndex].Width * LScale);
+    LRect.Height := Round(FPageInfo[LIndex].Height * LScale);
     if LRect.Width < LClient.Width - 2 * FPageMargin then
       LRect.Offset((LClient.Width - LRect.Width) div 2 - LRect.Left, 0);
 
@@ -1295,11 +1349,6 @@ begin
 
   LScale := 72 / Screen.PixelsPerInch;
   Result := 100 * (ClientWidth - 2 * FPageMargin) * LScale / FPageInfo[FPageIndex].Width;
-end;
-
-function TPDFiumControl.PageToScreen(const AValue: Single): Integer;
-begin
-  Result := Round(AValue * ZoomToScreen);
 end;
 
 function TPDFiumControl.SetSelStopCharIndex(const X, Y: Integer): Boolean;
@@ -1937,6 +1986,11 @@ begin
         LFromPage := LPrintDialog.FromPage;
         LToPage := LPrintDialog.ToPage;
       end;
+      { Note! Copies and collate won't work. Andy's core class needs to be fixed to get it working.
+        Capture here the variables and pass them to following Print function.
+
+        LCopies := LPrintDialog.Copies;
+        LCollate := LPrintDialog.Collate; }
     finally
       LPrintDialog.Free;
     end;
