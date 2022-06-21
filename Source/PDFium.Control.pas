@@ -696,6 +696,7 @@ var
   LCharIndex, LCharCount: Integer;
   LIndex, LPageIndex: Integer;
   LPage: TPDFPage;
+  LSearchText: string;
 begin
   Result := 0;
 
@@ -718,7 +719,11 @@ begin
 
       if not FSearchText.IsEmpty then
       begin
-        if LPage.BeginFind(FSearchText, FSearchMatchCase, FSearchWholeWords, False) then
+        LSearchText := FSearchText;
+        if not FSearchMatchCase then
+          LSearchText := LSearchText.ToLower; { Bug in PDFium }
+
+        if LPage.BeginFind(LSearchText, FSearchMatchCase, FSearchWholeWords, False) then
         try
           while LPage.FindNext(LCharIndex, LCharCount) do
           begin
@@ -732,6 +737,8 @@ begin
               SearchRects[LCount] := LPage.GetTextRect(LIndex);
               Inc(LCount);
             end;
+
+            Inc(Result);
           end;
         finally
           LPage.EndFind;
@@ -749,8 +756,6 @@ begin
                 Result := Trunc(ALeft.Left) - Trunc(ARight.Left);
             end)
           );
-
-        Inc(Result, LCount);
       end;
     end;
 
@@ -1573,39 +1578,8 @@ begin
 end;
 
 procedure TPDFiumControl.Print;
-var
-  LIndex: Integer;
-  LPage: TPDFPage;
-  LStream: TMemoryStream;
-  LPDFDocument: TPDFDocument;
 begin
-  LPDFDocument := CreatePDFDocument;
-  try
-    { Flatten pages. Needed for form field values. }
-    Screen.Cursor := crHourGlass;
-    LStream := TMemoryStream.Create;
-    try
-      FPDFDocument.SaveToStream(LStream); { Original }
-      LStream.Position := 0;
-
-      LPDFDocument.LoadFromStream(LStream);
-      for LIndex := 0 to FPageCount - 1 do
-      begin
-        LPage := LPDFDocument.Pages[LIndex];
-        FPDFPage_Flatten(LPage.Page, 1);
-      end;
-      LPDFDocument.SaveToStream(LStream);
-      LStream.Position := 0;
-      LPDFDocument.LoadFromStream(LStream);
-    finally
-      LStream.Free;
-      Screen.Cursor := crDefault;
-    end;
-
-    TPDFDocumentVclPrinter.PrintDocument(LPDFDocument, PrintJobTitle);
-  finally
-    LPDFDocument.Free;
-  end;
+  TPDFDocumentVclPrinter.PrintDocument(FPDFDocument, PrintJobTitle);
 end;
 
 procedure TPDFiumControl.Resize;
